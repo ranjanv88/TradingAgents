@@ -179,6 +179,53 @@ class TradingAgentsGraph:
                 checkpoint_thread_id=thread_id_value, portfolio=portfolio,
             )
 
+    def propagate_stream(self, company_name, trade_date, asset_type: str = "stock"):
+        """Yield merged state snapshots after each graph node, then return ``(final_state, signal)``.
+
+        Mirrors :meth:`propagate` exactly (same preamble, tail, and return
+        contract) but streams LangGraph ``values`` snapshots so callers can
+        render per-agent progress while the run is still in flight. Consume
+        with an explicit ``next()`` loop: snapshots come out of ``yield`` and
+        the ``(final_state, signal)`` pair arrives as ``StopIteration.value``.
+        """
+        self.ticker = company_name
+        self._resolve_pending_entries(company_name)
+        with self.checkpoint_scope(company_name, trade_date, asset_type) as thread_id_value:
+            past_context = self.memory_log.get_past_context(
+                company_name, as_of=self._memory_as_of(trade_date)
+            )
+            instrument_context = self.resolve_instrument_context(company_name, asset_type)
+            init_agent_state = self.propagator.create_initial_state(
+                company_name,
+                trade_date,
+                asset_type=asset_type,
+                past_context=past_context,
+                instrument_context=instrument_context,
+            )
+            args = self.propagator.get_graph_args()
+            if thread_id_value is not None:
+                args.setdefault("config", {}).setdefault("configurable", {})["thread_id"] = thread_id_value
+            graph_input = self.checkpoint_input(init_agent_state)
+            merged: dict[str, Any] = {}
+            for chunk in self.graph.stream(graph_input, **args):
+                if isinstance(chunk, dict):
+                    merged.update(chunk)
+                    yield dict(merged)
+            if "final_trade_decision" not in merged:
+                # Should not happen for a fresh run; fall back to a full
+                # invoke so the return contract still holds.
+                merged = self.graph.invoke(graph_input, **args)
+            final_state = merged
+            self.curr_state = final_state
+            self._log_state(trade_date, final_state)
+            self.memory_log.store_decision(
+                ticker=company_name,
+                trade_date=trade_date,
+                final_trade_decision=final_state["final_trade_decision"],
+            )
+            self.clear_checkpoint_on_success(company_name, trade_date, asset_type)
+            return final_state, self.process_signal(final_state["final_trade_decision"])
+
     def begin_checkpoint(self, company_name, trade_date, asset_type: str = "stock", portfolio=None) -> str | None:
         """Recompile the graph with a per-ticker checkpointer and return the
         ``thread_id`` to inject into the stream/invoke ``config`` (or ``None``
